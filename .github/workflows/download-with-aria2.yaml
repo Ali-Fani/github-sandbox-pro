@@ -21,9 +21,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 zip ffmpeg python3-pip git-lfs
+          sudo apt-get install -y aria2 zip ffmpeg python3-pip git
           pip install -U yt-dlp
-          git lfs install
 
       - name: Extract commands from commit
         id: extract
@@ -70,7 +69,7 @@ jobs:
       - name: Download everything to /tmp
         run: |
           mkdir -p /tmp/downloads
-          mkdir -p /tmp/lfs-downloads
+          mkdir -p /tmp/commit-downloads
 
           ########################################
           # 🌐 Normal downloads
@@ -116,87 +115,103 @@ jobs:
           done
 
           ########################################
-          # 📦 downloadc: → LFS commit downloads
+          # 📦 downloadc: → repo commit downloads
           ########################################
           for URL in ${{ steps.extract.outputs.commit_urls }}; do
             FILENAME=$(basename "$URL")
-            echo "📦 Downloading for LFS commit: $URL"
+            echo "📦 Downloading for commit: $URL"
 
             aria2c \
               --split=4 \
               --max-connection-per-server=4 \
               --file-allocation=none \
-              --dir="/tmp/lfs-downloads" \
+              --dir="/tmp/commit-downloads" \
               --out="$FILENAME" \
               "$URL"
           done
 
-      - name: Commit LFS files to repository
-        if: steps.extract.outputs.commit_urls != ''
+      - name: Prepare files for git and split files over 100MB
         run: |
-          # Make sure the downloads directory is tracked by LFS
+          set -euo pipefail
+
           mkdir -p downloads
 
-          # Track all files inside downloads/ with LFS (idempotent)
-          git lfs track "downloads/**"
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
 
-          # Ensure .gitattributes is committed if it changed
-          git add .gitattributes
+          SRC_DIRS = [Path("/tmp/downloads"), Path("/tmp/commit-downloads")]
+          OUT_DIR = Path("downloads")
 
-          # Configure git identity for the commit
+          LIMIT = 100 * 1024 * 1024      # GitHub hard limit for normal git objects
+          CHUNK = 95 * 1024 * 1024       # keep a safety margin
+
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+          for src_dir in SRC_DIRS:
+              if not src_dir.exists():
+                  continue
+
+              for file in src_dir.iterdir():
+                  if not file.is_file():
+                      continue
+
+                  size = file.stat().st_size
+                  stem = file.stem
+
+                  # Keep small files as normal files
+                  if size <= LIMIT:
+                      shutil.move(str(file), str(OUT_DIR / file.name))
+                      continue
+
+                  # Split large files into a folder named after the file (without extension)
+                  target_dir = OUT_DIR / stem
+                  target_dir.mkdir(parents=True, exist_ok=True)
+
+                  part_index = 1
+                  with file.open("rb") as f:
+                      while True:
+                          chunk = f.read(CHUNK)
+                          if not chunk:
+                              break
+
+                          part_name = f"{file.name}.part-{part_index:04d}"
+                          part_path = target_dir / part_name
+                          with part_path.open("wb") as out:
+                              out.write(chunk)
+
+                          part_index += 1
+
+                  # Optional manifest for easier reassembly
+                  manifest = target_dir / "MANIFEST.txt"
+                  manifest.write_text(
+                      f"original_file={file.name}\n"
+                      f"original_size={size}\n"
+                      f"chunk_size={CHUNK}\n"
+                      f"parts={part_index - 1}\n",
+                      encoding="utf-8",
+                  )
+
+                  file.unlink()
+          PY
+
+      - name: Commit repo files
+        if: steps.extract.outputs.commit_urls != ''
+        run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Move downloaded files into the tracked downloads/ folder
-          for FILE in /tmp/lfs-downloads/*; do
-            [ -f "$FILE" ] || continue
-            BASENAME=$(basename "$FILE")
-            echo "📂 Moving $BASENAME → downloads/$BASENAME (LFS)"
-            mv "$FILE" "downloads/$BASENAME"
-            git add "downloads/$BASENAME"
-          done
+          git add downloads
 
-          # Commit if anything was staged
           if ! git diff --cached --quiet; then
-            git commit -m "chore: add LFS files via downloadc [skip ci]"
+            git commit -m "chore: add downloaded files [skip ci]"
             git push
           else
-            echo "⚠️ Nothing staged — skipping LFS commit"
-          fi
-
-      - name: Split large files & prepare release assets
-        run: |
-          mkdir -p downloads
-          LIMIT=$((1900 * 1024 * 1024))
-
-          for FILE in /tmp/downloads/*; do
-            [ -f "$FILE" ] || continue
-
-            SIZE=$(stat -c%s "$FILE")
-            BASENAME=$(basename "$FILE")
-
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ Splitting $BASENAME (~1.9GB parts)"
-
-              zip -s 1900m "downloads/${BASENAME}.zip" "$FILE"
-
-              rm -f "$FILE"
-            else
-              mv "$FILE" "downloads/$BASENAME"
-            fi
-          done
-
-          ########################################
-          # Optional zip mode
-          ########################################
-          if [ "${{ steps.extract.outputs.mode }}" = "zip" ]; then
-            FINAL="downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
-            zip -j "$FINAL" downloads/*
+            echo "⚠️ Nothing staged — skipping commit"
           fi
 
       - name: Generate release tag
         id: tag
-        # Only run if there are release assets (skip if only downloadc: was used)
         if: steps.extract.outputs.urls != '' || steps.extract.outputs.yt_urls != '' || steps.extract.outputs.yt_audio_urls != ''
         run: |
           TAG="auto-$(date +%Y%m%d-%H%M%S)"
@@ -209,4 +224,4 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "Auto Release ${{ steps.tag.outputs.tag }}"
           body: ${{ github.event.head_commit.message }}
-          files: downloads/*
+          files: downloads/**
