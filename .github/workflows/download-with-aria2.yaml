@@ -53,7 +53,9 @@ jobs:
           echo "urls=$URLS"       >> $GITHUB_OUTPUT
           echo "commit_urls=$COMMIT_URLS" >> $GITHUB_OUTPUT
 
-          [ "$HAS" = "false" ] && echo "⏭️  No download command — workflow skipped"
+          if [ "$HAS" = "false" ]; then
+            echo "⏭️  No download command — workflow skipped"
+          fi
 
   # ── Job 2: download, split, commit and/or release ─────────────────────────
   # Only runs when Job 1 found a valid command.
