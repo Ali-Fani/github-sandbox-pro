@@ -18,6 +18,7 @@ jobs:
       urls:        ${{ steps.detect.outputs.urls }}
       commit_urls: ${{ steps.detect.outputs.commit_urls }}
       tg_urls:     ${{ steps.detect.outputs.tg_urls }}
+      file_urls:   ${{ steps.detect.outputs.file_urls }}
 
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +59,7 @@ jobs:
 
           # ── File-based trigger: download_links.txt ────────────────────────────
           LINKS_FILE="download_links.txt"
+          FILE_URLS=""
           if git rev-parse HEAD~1 >/dev/null 2>&1; then
             CHANGED=$(git diff --name-only HEAD~1 HEAD)
           else
@@ -67,9 +69,8 @@ jobs:
           if echo "$CHANGED" | grep -qxF "$LINKS_FILE" && [ -f "$LINKS_FILE" ]; then
             FILE_URLS=$(grep -vE '^\s*(#|$)' "$LINKS_FILE" | tr '\n' ' ')
             if [ -n "$FILE_URLS" ]; then
-              URLS="$URLS $FILE_URLS"
               HAS="true"
-              echo "📄 $LINKS_FILE changed — queued $(echo "$FILE_URLS" | wc -w) URL(s) for release"
+              echo "📄 $LINKS_FILE changed — queued $(echo "$FILE_URLS" | wc -w) URL(s) for commit"
             fi
           fi
 
@@ -78,6 +79,7 @@ jobs:
           echo "urls=$URLS"       >> $GITHUB_OUTPUT
           echo "commit_urls=$COMMIT_URLS" >> $GITHUB_OUTPUT
           echo "tg_urls=$TG_URLS" >> $GITHUB_OUTPUT
+          echo "file_urls=$FILE_URLS" >> $GITHUB_OUTPUT
 
           if [ "$HAS" = "false" ]; then
             echo "⏭️  No download command — workflow skipped"
@@ -235,7 +237,7 @@ jobs:
 
       - name: Download files
         run: |
-          mkdir -p /tmp/release-dl /tmp/commit-dl
+          mkdir -p /tmp/release-dl /tmp/commit-dl /tmp/file-dl
           FAILED_URLS=""
           OK_COUNT=0
           FAIL_COUNT=0
@@ -260,6 +262,21 @@ jobs:
             if aria2c --split=4 --max-connection-per-server=4 \
                       --file-allocation=none \
                       --dir=/tmp/commit-dl \
+                      --out="$(basename "$URL")" \
+                      "$URL"; then
+              OK_COUNT=$((OK_COUNT + 1))
+            else
+              echo "⚠️  FAILED: $URL"
+              FAILED_URLS="$FAILED_URLS\n  - $URL"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+          done
+
+          for URL in ${{ needs.check-command.outputs.file_urls }}; do
+            echo "📄 File:    $URL"
+            if aria2c --split=4 --max-connection-per-server=4 \
+                      --file-allocation=none \
+                      --dir=/tmp/file-dl \
                       --out="$(basename "$URL")" \
                       "$URL"; then
               OK_COUNT=$((OK_COUNT + 1))
@@ -306,6 +323,15 @@ jobs:
           for f in /tmp/release-dl/*; do
             [ -f "$f" ] && mv "$f" release-files/ || true
           done
+
+          # ── File-based downloads: move to downloads/<commit-hash>/ ──
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          DOWNLOAD_DIR="downloads/$COMMIT_HASH"
+          if [ -n "$(ls -A /tmp/file-dl 2>/dev/null)" ]; then
+            mkdir -p "$DOWNLOAD_DIR"
+            mv /tmp/file-dl/* "$DOWNLOAD_DIR/"
+            echo "📄 Moved $(ls -1 "$DOWNLOAD_DIR" | wc -l) file(s) to $DOWNLOAD_DIR"
+          fi
 
           # ── Commit files: wrap each large file in a split zip (store mode) ──
           # zip -s 95m  → multi-volume archive, parts = name.z01, name.z02, …, name.zip
@@ -368,12 +394,12 @@ jobs:
           shopt -u nullglob
 
       - name: Commit repo files
-        if: needs.check-command.outputs.commit_urls != '' || needs.check-command.outputs.tg_urls != ''
+        if: needs.check-command.outputs.commit_urls != '' || needs.check-command.outputs.tg_urls != '' || needs.check-command.outputs.file_urls != ''
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add commit-files
+          git add commit-files downloads
 
           if ! git diff --cached --quiet; then
             git commit -m "chore: add downloaded files [skip ci]"
