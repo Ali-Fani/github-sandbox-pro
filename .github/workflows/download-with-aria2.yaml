@@ -17,6 +17,7 @@ jobs:
       mode:        ${{ steps.detect.outputs.mode }}
       urls:        ${{ steps.detect.outputs.urls }}
       commit_urls: ${{ steps.detect.outputs.commit_urls }}
+      tg_urls:     ${{ steps.detect.outputs.tg_urls }}
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +34,7 @@ jobs:
           MODE="normal"
           URLS=""
           COMMIT_URLS=""
+          TG_URLS=""
 
           if echo "$MSG" | grep -qP 'download-zip:'; then
             MODE="zip"
@@ -48,10 +50,16 @@ jobs:
             HAS="true"
           fi
 
+          if echo "$MSG" | grep -qP 'telegram:'; then
+            TG_URLS=$(echo "$MSG" | grep -oP 'telegram:\s*\K.*')
+            HAS="true"
+          fi
+
           echo "has_command=$HAS" >> $GITHUB_OUTPUT
           echo "mode=$MODE"       >> $GITHUB_OUTPUT
           echo "urls=$URLS"       >> $GITHUB_OUTPUT
           echo "commit_urls=$COMMIT_URLS" >> $GITHUB_OUTPUT
+          echo "tg_urls=$TG_URLS"  >> $GITHUB_OUTPUT
 
           if [ "$HAS" = "false" ]; then
             echo "⏭️  No download command — workflow skipped"
@@ -77,7 +85,86 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y aria2 zip git
+          sudo apt-get install -y aria2 zip git python3 python3-pip
+
+      - name: Install Pyrogram (Telegram support)
+        if: needs.check-command.outputs.tg_urls != ''
+        run: pip install -q pyrogram tgcrypto
+
+      - name: Download Telegram media
+        if: needs.check-command.outputs.tg_urls != ''
+        env:
+          TG_API_ID:         ${{ secrets.TG_API_ID }}
+          TG_API_HASH:       ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_URLS:           ${{ needs.check-command.outputs.tg_urls }}
+        run: |
+          python3 - <<'PYEOF'
+          import asyncio, os, re, sys
+          from pathlib import Path
+          from pyrogram import Client
+
+          API_ID  = int(os.environ["TG_API_ID"])
+          API_HASH = os.environ["TG_API_HASH"]
+          SESSION  = os.environ["TG_SESSION_STRING"]
+          URLS     = os.environ["TG_URLS"].split()
+          OUT_DIR  = Path("/tmp/commit-dl")
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+          # Matches: t.me/<chat>/<id>  and  t.me/c/<int_id>/<id>
+          RE_PUBLIC  = re.compile(r"t\.me/([^/c][^/]*?)/(\d+)")
+          RE_PRIVATE = re.compile(r"t\.me/c/(\d+)/(\d+)")
+
+          def parse_url(url):
+              m = RE_PRIVATE.search(url)
+              if m:
+                  return int("-100" + m.group(1)), int(m.group(2))
+              m = RE_PUBLIC.search(url)
+              if m:
+                  return m.group(1), int(m.group(2))
+              raise ValueError(f"Cannot parse Telegram URL: {url}")
+
+          async def main():
+              async with Client(
+                  "session",
+                  api_id=API_ID,
+                  api_hash=API_HASH,
+                  session_string=SESSION,
+              ) as app:
+                  for url in URLS:
+                      print(f"📨 Fetching: {url}")
+                      try:
+                          chat, msg_id = parse_url(url)
+                      except ValueError as e:
+                          print(f"❌ {e}", file=sys.stderr)
+                          sys.exit(1)
+
+                      msg = await app.get_messages(chat, msg_id)
+                      if not msg:
+                          print(f"❌ Message not found: {url}", file=sys.stderr)
+                          sys.exit(1)
+
+                      # Expand media groups (albums)
+                      if msg.media_group_id:
+                          msgs = await app.get_media_group(chat, msg_id)
+                      else:
+                          msgs = [msg]
+
+                      chat_slug = str(chat).lstrip("-").replace("/", "_")
+                      for idx, m in enumerate(msgs, 1):
+                          if not m.media:
+                              print(f"  ⚠️  Message {m.id} has no media, skipping")
+                              continue
+                          suffix = f"-{idx}" if len(msgs) > 1 else ""
+                          file_name = f"{chat_slug}-{m.id}{suffix}"
+                          print(f"  ⬇️  Downloading item {idx}/{len(msgs)}")
+                          path = await app.download_media(
+                              m, file_name=str(OUT_DIR / file_name)
+                          )
+                          print(f"  ✅  Saved: {path}")
+
+          asyncio.run(main())
+          PYEOF
 
       - name: Download files
         run: |
@@ -110,6 +197,9 @@ jobs:
           mv /tmp/release-bundle.zip /tmp/release-dl/release-bundle.zip
 
       - name: Prepare workspace — move release files, split commit files > 95 MB
+        env:
+          GH_REPO:   ${{ github.repository }}
+          GH_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           mkdir -p release-files commit-files
@@ -165,12 +255,21 @@ jobs:
               printf '%s\r\n' "macOS   : same as Linux (install zip via Homebrew if needed)."
             } > "$target/MANIFEST.txt"
 
+            # LINKS.txt — one raw GitHub URL per part, wget/curl-friendly
+            BASE_URL="https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/commit-files/$stem"
+            {
+              for part_file in $(ls -1 "$target"/${stem}.z* "$target"/${stem}.zip 2>/dev/null | sort); do
+                part_name=$(basename "$part_file")
+                printf '%s\r\n' "${BASE_URL}/${part_name}"
+              done
+            } > "$target/LINKS.txt"
+
             rm -f "$file"
           done
           shopt -u nullglob
 
       - name: Commit repo files
-        if: needs.check-command.outputs.commit_urls != ''
+        if: needs.check-command.outputs.commit_urls != '' || needs.check-command.outputs.tg_urls != ''
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
