@@ -324,14 +324,64 @@ jobs:
             [ -f "$f" ] && mv "$f" release-files/ || true
           done
 
-          # ── File-based downloads: move to downloads/<commit-hash>/ ──
+          # ── File-based downloads: move to downloads/<commit-hash>/ with split zip for >95MB ──
           COMMIT_HASH=$(git rev-parse --short HEAD)
           DOWNLOAD_DIR="downloads/$COMMIT_HASH"
-          if [ -n "$(ls -A /tmp/file-dl 2>/dev/null)" ]; then
+          LIMIT=$((95 * 1024 * 1024))
+          WS="$GITHUB_WORKSPACE"
+
+          shopt -s nullglob
+          for file in /tmp/file-dl/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            size=$(stat -c%s "$file")
+
             mkdir -p "$DOWNLOAD_DIR"
-            mv /tmp/file-dl/* "$DOWNLOAD_DIR/"
-            echo "📄 Moved $(ls -1 "$DOWNLOAD_DIR" | wc -l) file(s) to $DOWNLOAD_DIR"
-          fi
+
+            if [ "$size" -le "$LIMIT" ]; then
+              mv "$file" "$DOWNLOAD_DIR/$name"
+              continue
+            fi
+
+            stem="${name%.*}"
+            target="$WS/$DOWNLOAD_DIR/$stem"
+            mkdir -p "$target"
+
+            echo "�️  Splitting $name ($((size / 1024 / 1024)) MB) into $target/$stem.zip"
+            ( cd /tmp/file-dl && zip -s 95m -0 -j "$target/$stem.zip" "$name" )
+
+            total=$(ls -1 "$target"/${stem}.z* "$target"/${stem}.zip 2>/dev/null | wc -l)
+
+            size_mb=$((size / 1024 / 1024))
+            {
+              printf '%s\r\n' "original_file = $name"
+              printf '%s\r\n' "original_size = $size bytes ($size_mb MB)"
+              printf '%s\r\n' "split_method  = zip multi-volume, store (no compression)"
+              printf '%s\r\n' "volume_size   = 95 MB"
+              printf '%s\r\n' "total_volumes = $total"
+              printf '%s\r\n' ""
+              printf '%s\r\n' "HOW TO EXTRACT"
+              printf '%s\r\n' "=============="
+              printf '%s\r\n' "Windows : keep all $stem.z* files in the same folder, then open"
+              printf '%s\r\n' "          $stem.zip with 7-Zip, WinRAR, or PeaZip and Extract."
+              printf '%s\r\n' "          (Windows Explorer cannot handle split zips — use 7-Zip.)"
+              printf '%s\r\n' ""
+              printf '%s\r\n' "Linux   : zip -s 0 $stem.zip --out joined.zip && unzip joined.zip"
+              printf '%s\r\n' "macOS   : same as Linux (install zip via Homebrew if needed)."
+            } > "$target/MANIFEST.txt"
+
+            # LINKS.txt — one raw GitHub URL per part, wget/curl-friendly
+            BASE_URL="https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/$DOWNLOAD_DIR/$stem"
+            {
+              for part_file in $(ls -1 "$target"/${stem}.z* "$target"/${stem}.zip 2>/dev/null | sort); do
+                part_name=$(basename "$part_file")
+                printf '%s\r\n' "${BASE_URL}/${part_name}"
+              done
+            } > "$target/LINKS.txt"
+
+            rm -f "$file"
+          done
+          shopt -u nullglob
 
           # ── Commit files: wrap each large file in a split zip (store mode) ──
           # zip -s 95m  → multi-volume archive, parts = name.z01, name.z02, …, name.zip
