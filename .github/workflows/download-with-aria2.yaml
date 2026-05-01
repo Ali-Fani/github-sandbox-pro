@@ -46,8 +46,18 @@ jobs:
           fi
 
           if echo "$MSG" | grep -qP 'downloadc:'; then
-            COMMIT_URLS=$(echo "$MSG" | grep -oP 'downloadc:\s*\K.*')
-            HAS="true"
+            # Extract URLs after downloadc: (space-separated or multi-line until next command)
+            COMMIT_URLS=$(python3 -c "
+import re, sys
+msg = sys.argv[1]
+# Match downloadc: and capture everything until next command or end
+m = re.search(r'downloadc:\s*(.*?)(?=\n\s*(?:download|download-zip|downloadc|telegram):|\Z)', msg, re.DOTALL)
+if m:
+    # Normalize whitespace: newlines become spaces, collapse multiple spaces
+    urls = ' '.join(m.group(1).split())
+    print(urls)
+" "$MSG")
+            [ -n "$COMMIT_URLS" ] && HAS="true"
           fi
 
           if echo "$MSG" | grep -qP 'telegram:'; then
@@ -55,11 +65,28 @@ jobs:
             HAS="true"
           fi
 
+          # ── File-based trigger: download_links.txt ────────────────────────────
+          LINKS_FILE="download_links.txt"
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          else
+            CHANGED=$(git show --name-only --pretty=format: HEAD)
+          fi
+
+          if echo "$CHANGED" | grep -qxF "$LINKS_FILE" && [ -f "$LINKS_FILE" ]; then
+            FILE_URLS=$(grep -vE '^\s*(#|$)' "$LINKS_FILE" | tr '\n' ' ')
+            if [ -n "$FILE_URLS" ]; then
+              URLS="$URLS $FILE_URLS"
+              HAS="true"
+              echo "📄 $LINKS_FILE changed — queued $(echo "$FILE_URLS" | wc -w) URL(s) for release"
+            fi
+          fi
+
           echo "has_command=$HAS" >> $GITHUB_OUTPUT
           echo "mode=$MODE"       >> $GITHUB_OUTPUT
           echo "urls=$URLS"       >> $GITHUB_OUTPUT
           echo "commit_urls=$COMMIT_URLS" >> $GITHUB_OUTPUT
-          echo "tg_urls=$TG_URLS"  >> $GITHUB_OUTPUT
+          echo "tg_urls=$TG_URLS" >> $GITHUB_OUTPUT
 
           if [ "$HAS" = "false" ]; then
             echo "⏭️  No download command — workflow skipped"
@@ -103,6 +130,7 @@ jobs:
           import asyncio, os, re, sys
           from pathlib import Path
           from pyrogram import Client
+          from pyrogram.errors import FloodWait, MessageNotModified, MessageIdInvalid
 
           API_ID  = int(os.environ["TG_API_ID"])
           API_HASH = os.environ["TG_API_HASH"]
@@ -115,6 +143,10 @@ jobs:
           RE_PUBLIC  = re.compile(r"t\.me/([^/c][^/]*?)/(\d+)")
           RE_PRIVATE = re.compile(r"t\.me/c/(\d+)/(\d+)")
 
+          ok_count = 0
+          fail_count = 0
+          failed_urls = []
+
           def parse_url(url):
               m = RE_PRIVATE.search(url)
               if m:
@@ -122,9 +154,10 @@ jobs:
               m = RE_PUBLIC.search(url)
               if m:
                   return m.group(1), int(m.group(2))
-              raise ValueError(f"Cannot parse Telegram URL: {url}")
+              return None, None  # Return None instead of raising
 
           async def main():
+              global ok_count, fail_count
               async with Client(
                   "session",
                   api_id=API_ID,
@@ -133,24 +166,39 @@ jobs:
               ) as app:
                   for url in URLS:
                       print(f"📨 Fetching: {url}")
-                      try:
-                          chat, msg_id = parse_url(url)
-                      except ValueError as e:
-                          print(f"❌ {e}", file=sys.stderr)
-                          sys.exit(1)
+                      chat, msg_id = parse_url(url)
+                      if chat is None:
+                          print(f"  ⚠️  Cannot parse URL: {url}")
+                          failed_urls.append(url)
+                          fail_count += 1
+                          continue
 
-                      msg = await app.get_messages(chat, msg_id)
+                      try:
+                          msg = await app.get_messages(chat, msg_id)
+                      except Exception as e:
+                          print(f"  ⚠️  Error fetching message: {e}")
+                          failed_urls.append(url)
+                          fail_count += 1
+                          continue
+
                       if not msg:
-                          print(f"❌ Message not found: {url}", file=sys.stderr)
-                          sys.exit(1)
+                          print(f"  ⚠️  Message not found: {url}")
+                          failed_urls.append(url)
+                          fail_count += 1
+                          continue
 
                       # Expand media groups (albums)
-                      if msg.media_group_id:
-                          msgs = await app.get_media_group(chat, msg_id)
-                      else:
-                          msgs = [msg]
+                      try:
+                          if msg.media_group_id:
+                              msgs = await app.get_media_group(chat, msg_id)
+                          else:
+                              msgs = [msg]
+                      except Exception as e:
+                          print(f"  ⚠️  Error fetching media group: {e}")
+                          msgs = [msg] if msg.media else []
 
                       chat_slug = str(chat).lstrip("-").replace("/", "_")
+                      downloaded = 0
                       for idx, m in enumerate(msgs, 1):
                           if not m.media:
                               print(f"  ⚠️  Message {m.id} has no media, skipping")
@@ -158,35 +206,95 @@ jobs:
                           suffix = f"-{idx}" if len(msgs) > 1 else ""
                           file_name = f"{chat_slug}-{m.id}{suffix}"
                           print(f"  ⬇️  Downloading item {idx}/{len(msgs)}")
-                          path = await app.download_media(
-                              m, file_name=str(OUT_DIR / file_name)
-                          )
-                          print(f"  ✅  Saved: {path}")
+                          try:
+                              path = await app.download_media(
+                                  m, file_name=str(OUT_DIR / file_name)
+                              )
+                              if path:
+                                  print(f"  ✅  Saved: {path}")
+                                  downloaded += 1
+                              else:
+                                  print(f"  ⚠️  Download returned None")
+                          except Exception as e:
+                              print(f"  ⚠️  Download failed: {e}")
+
+                      if downloaded > 0:
+                          ok_count += 1
+                      else:
+                          failed_urls.append(url)
+                          fail_count += 1
 
           asyncio.run(main())
+
+          # Summary
+          print("\n" + "=" * 63)
+          print(f"Telegram Download Summary: {ok_count} succeeded, {fail_count} failed")
+          print("=" * 63)
+          if fail_count > 0:
+              print("Failed URLs:")
+              for url in failed_urls:
+                  print(f"  - {url}")
+              print("=" * 63)
+
+          # Exit with error only if ALL downloads failed
+          if len(URLS) > 0 and ok_count == 0:
+              print("❌ All Telegram downloads failed — aborting")
+              sys.exit(1)
           PYEOF
 
       - name: Download files
         run: |
           mkdir -p /tmp/release-dl /tmp/commit-dl
+          FAILED_URLS=""
+          OK_COUNT=0
+          FAIL_COUNT=0
 
           for URL in ${{ needs.check-command.outputs.urls }}; do
             echo "⬇️  Release: $URL"
-            aria2c --split=4 --max-connection-per-server=4 \
-                   --file-allocation=none \
-                   --dir=/tmp/release-dl \
-                   --out="$(basename "$URL")" \
-                   "$URL"
+            if aria2c --split=4 --max-connection-per-server=4 \
+                      --file-allocation=none \
+                      --dir=/tmp/release-dl \
+                      --out="$(basename "$URL")" \
+                      "$URL"; then
+              OK_COUNT=$((OK_COUNT + 1))
+            else
+              echo "⚠️  FAILED: $URL"
+              FAILED_URLS="$FAILED_URLS\n  - $URL"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
           done
 
           for URL in ${{ needs.check-command.outputs.commit_urls }}; do
             echo "📦 Commit:  $URL"
-            aria2c --split=4 --max-connection-per-server=4 \
-                   --file-allocation=none \
-                   --dir=/tmp/commit-dl \
-                   --out="$(basename "$URL")" \
-                   "$URL"
+            if aria2c --split=4 --max-connection-per-server=4 \
+                      --file-allocation=none \
+                      --dir=/tmp/commit-dl \
+                      --out="$(basename "$URL")" \
+                      "$URL"; then
+              OK_COUNT=$((OK_COUNT + 1))
+            else
+              echo "⚠️  FAILED: $URL"
+              FAILED_URLS="$FAILED_URLS\n  - $URL"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
           done
+
+          echo ""
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "Download Summary: $OK_COUNT succeeded, $FAIL_COUNT failed"
+          echo "═══════════════════════════════════════════════════════════════"
+          if [ $FAIL_COUNT -gt 0 ]; then
+            echo -e "Failed URLs:$FAILED_URLS"
+            echo "═══════════════════════════════════════════════════════════════"
+          fi
+
+          # Don't fail the workflow if at least one download succeeded
+          # Only fail if ALL downloads failed and there were URLs to download
+          TOTAL_URLS=$((OK_COUNT + FAIL_COUNT))
+          if [ $TOTAL_URLS -gt 0 ] && [ $OK_COUNT -eq 0 ]; then
+            echo "❌ All downloads failed — aborting"
+            exit 1
+          fi
 
       - name: Bundle into zip (download-zip mode)
         if: needs.check-command.outputs.mode == 'zip'
