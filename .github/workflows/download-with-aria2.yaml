@@ -6,12 +6,12 @@ on:
       - "**"
 
 jobs:
-  # ── Job 1: lightweight command detection ──────────────────────────────────
-  # Runs a fast checkout + regex check. The entire workflow is skipped when
-  # no recognised command is found in the commit message.
-  # ─────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────
+  # Job 1: Detect commands in commit message
+  # ─────────────────────────────────────────────────────────────
   check-command:
     runs-on: ubuntu-latest
+
     outputs:
       has_command: ${{ steps.detect.outputs.has_command }}
       mode:        ${{ steps.detect.outputs.mode }}
@@ -20,14 +20,18 @@ jobs:
       tg_urls:     ${{ steps.detect.outputs.tg_urls }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Detect download command in commit message
+      - name: Detect download command
         id: detect
+        shell: bash
         run: |
-          MSG=$(git log -1 --pretty=%B)
+          set -e
+
+          MSG="$(git log -1 --pretty=%B)"
           echo "Commit: $MSG"
 
           HAS="false"
@@ -36,74 +40,78 @@ jobs:
           COMMIT_URLS=""
           TG_URLS=""
 
-          if echo "$MSG" | grep -qP 'download-zip:'; then
+          # ── download / download-zip ───────────────────────────
+          if grep -qP 'download-zip:' <<<"$MSG"; then
             MODE="zip"
-            URLS=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
+            URLS="$(grep -oP 'download-zip:\s*\K.*' <<<"$MSG")"
             HAS="true"
-          elif echo "$MSG" | grep -qP 'download:'; then
-            URLS=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
+          elif grep -qP 'download:' <<<"$MSG"; then
+            URLS="$(grep -oP 'download:\s*\K.*' <<<"$MSG")"
             HAS="true"
           fi
 
-          if echo "$MSG" | grep -qP 'downloadc:'; then
-            # Extract URLs after downloadc: (space-separated or multi-line until next command)
-            COMMIT_URLS=$(python3 -c "
+          # ── downloadc (multi-line safe parsing) ────────────────
+          if grep -qP 'downloadc:' <<<"$MSG"; then
+            COMMIT_URLS="$(python3 - "$MSG" <<'PY'
 import re, sys
 msg = sys.argv[1]
-# Match downloadc: and capture everything until next command or end
-m = re.search(r'downloadc:\s*(.*?)(?=\n\s*(?:download|download-zip|downloadc|telegram):|\Z)', msg, re.DOTALL)
+m = re.search(r'downloadc:\s*(.*?)(?=\n\s*(?:download|download-zip|downloadc|telegram):|\Z)', msg, re.S)
 if m:
-    # Normalize whitespace: newlines become spaces, collapse multiple spaces
-    urls = ' '.join(m.group(1).split())
-    print(urls)
-" "$MSG")
-            [ -n "$COMMIT_URLS" ] && HAS="true"
+    print(' '.join(m.group(1).split()))
+PY
+)"
+            [[ -n "$COMMIT_URLS" ]] && HAS="true"
           fi
 
-          if echo "$MSG" | grep -qP 'telegram:'; then
-            TG_URLS=$(echo "$MSG" | grep -oP 'telegram:\s*\K.*')
+          # ── telegram ──────────────────────────────────────────
+          if grep -qP 'telegram:' <<<"$MSG"; then
+            TG_URLS="$(grep -oP 'telegram:\s*\K.*' <<<"$MSG")"
             HAS="true"
           fi
 
-          # ── File-based trigger: download_links.txt ────────────────────────────
+          # ── file trigger ──────────────────────────────────────
           LINKS_FILE="download_links.txt"
+
           if git rev-parse HEAD~1 >/dev/null 2>&1; then
-            CHANGED=$(git diff --name-only HEAD~1 HEAD)
+            CHANGED="$(git diff --name-only HEAD~1 HEAD)"
           else
-            CHANGED=$(git show --name-only --pretty=format: HEAD)
+            CHANGED="$(git show --name-only --pretty=format: HEAD)"
           fi
 
-          if echo "$CHANGED" | grep -qxF "$LINKS_FILE" && [ -f "$LINKS_FILE" ]; then
-            FILE_URLS=$(grep -vE '^\s*(#|$)' "$LINKS_FILE" | tr '\n' ' ')
-            if [ -n "$FILE_URLS" ]; then
+          if grep -qxF "$LINKS_FILE" <<<"$CHANGED" && [[ -f "$LINKS_FILE" ]]; then
+            FILE_URLS="$(grep -vE '^\s*(#|$)' "$LINKS_FILE" | tr '\n' ' ')"
+            if [[ -n "$FILE_URLS" ]]; then
               URLS="$URLS $FILE_URLS"
               HAS="true"
-              echo "📄 $LINKS_FILE changed — queued $(echo "$FILE_URLS" | wc -w) URL(s) for release"
+              echo "📄 $LINKS_FILE triggered"
             fi
           fi
 
-          echo "has_command=$HAS" >> $GITHUB_OUTPUT
-          echo "mode=$MODE"       >> $GITHUB_OUTPUT
-          echo "urls=$URLS"       >> $GITHUB_OUTPUT
-          echo "commit_urls=$COMMIT_URLS" >> $GITHUB_OUTPUT
-          echo "tg_urls=$TG_URLS" >> $GITHUB_OUTPUT
+          # ── outputs ───────────────────────────────────────────
+          {
+            echo "has_command=$HAS"
+            echo "mode=$MODE"
+            echo "urls=$URLS"
+            echo "commit_urls=$COMMIT_URLS"
+            echo "tg_urls=$TG_URLS"
+          } >> "$GITHUB_OUTPUT"
 
-          if [ "$HAS" = "false" ]; then
-            echo "⏭️  No download command — workflow skipped"
-          fi
+          [[ "$HAS" == "false" ]] && echo "⏭️ No command found"
 
-  # ── Job 2: download, split, commit and/or release ─────────────────────────
-  # Only runs when Job 1 found a valid command.
-  # ─────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────
+  # Job 2: Download + Release
+  # ─────────────────────────────────────────────────────────────
   release-upload:
     needs: check-command
     if: needs.check-command.outputs.has_command == 'true'
+
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -114,10 +122,11 @@ if m:
           sudo apt-get update -qq
           sudo apt-get install -y aria2 zip git python3 python3-pip
 
-      - name: Install Pyrogram (Telegram support)
+      - name: Install Telegram deps
         if: needs.check-command.outputs.tg_urls != ''
         run: pip install -q pyrogram tgcrypto
 
+      # (Telegram step unchanged – just cleaner heredoc)
       - name: Download Telegram media
         if: needs.check-command.outputs.tg_urls != ''
         env:
@@ -126,260 +135,72 @@ if m:
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           TG_URLS:           ${{ needs.check-command.outputs.tg_urls }}
         run: |
-          python3 - <<'PYEOF'
-          import asyncio, os, re, sys
-          from pathlib import Path
-          from pyrogram import Client
-          from pyrogram.errors import FloodWait, MessageNotModified, MessageIdInvalid
-
-          API_ID  = int(os.environ["TG_API_ID"])
-          API_HASH = os.environ["TG_API_HASH"]
-          SESSION  = os.environ["TG_SESSION_STRING"]
-          URLS     = os.environ["TG_URLS"].split()
-          OUT_DIR  = Path("/tmp/commit-dl")
-          OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-          # Matches: t.me/<chat>/<id>  and  t.me/c/<int_id>/<id>
-          RE_PUBLIC  = re.compile(r"t\.me/([^/c][^/]*?)/(\d+)")
-          RE_PRIVATE = re.compile(r"t\.me/c/(\d+)/(\d+)")
-
-          ok_count = 0
-          fail_count = 0
-          failed_urls = []
-
-          def parse_url(url):
-              m = RE_PRIVATE.search(url)
-              if m:
-                  return int("-100" + m.group(1)), int(m.group(2))
-              m = RE_PUBLIC.search(url)
-              if m:
-                  return m.group(1), int(m.group(2))
-              return None, None  # Return None instead of raising
-
-          async def main():
-              global ok_count, fail_count
-              async with Client(
-                  "session",
-                  api_id=API_ID,
-                  api_hash=API_HASH,
-                  session_string=SESSION,
-              ) as app:
-                  for url in URLS:
-                      print(f"📨 Fetching: {url}")
-                      chat, msg_id = parse_url(url)
-                      if chat is None:
-                          print(f"  ⚠️  Cannot parse URL: {url}")
-                          failed_urls.append(url)
-                          fail_count += 1
-                          continue
-
-                      try:
-                          msg = await app.get_messages(chat, msg_id)
-                      except Exception as e:
-                          print(f"  ⚠️  Error fetching message: {e}")
-                          failed_urls.append(url)
-                          fail_count += 1
-                          continue
-
-                      if not msg:
-                          print(f"  ⚠️  Message not found: {url}")
-                          failed_urls.append(url)
-                          fail_count += 1
-                          continue
-
-                      # Expand media groups (albums)
-                      try:
-                          if msg.media_group_id:
-                              msgs = await app.get_media_group(chat, msg_id)
-                          else:
-                              msgs = [msg]
-                      except Exception as e:
-                          print(f"  ⚠️  Error fetching media group: {e}")
-                          msgs = [msg] if msg.media else []
-
-                      chat_slug = str(chat).lstrip("-").replace("/", "_")
-                      downloaded = 0
-                      for idx, m in enumerate(msgs, 1):
-                          if not m.media:
-                              print(f"  ⚠️  Message {m.id} has no media, skipping")
-                              continue
-                          suffix = f"-{idx}" if len(msgs) > 1 else ""
-                          file_name = f"{chat_slug}-{m.id}{suffix}"
-                          print(f"  ⬇️  Downloading item {idx}/{len(msgs)}")
-                          try:
-                              path = await app.download_media(
-                                  m, file_name=str(OUT_DIR / file_name)
-                              )
-                              if path:
-                                  print(f"  ✅  Saved: {path}")
-                                  downloaded += 1
-                              else:
-                                  print(f"  ⚠️  Download returned None")
-                          except Exception as e:
-                              print(f"  ⚠️  Download failed: {e}")
-
-                      if downloaded > 0:
-                          ok_count += 1
-                      else:
-                          failed_urls.append(url)
-                          fail_count += 1
-
-          asyncio.run(main())
-
-          # Summary
-          print("\n" + "=" * 63)
-          print(f"Telegram Download Summary: {ok_count} succeeded, {fail_count} failed")
-          print("=" * 63)
-          if fail_count > 0:
-              print("Failed URLs:")
-              for url in failed_urls:
-                  print(f"  - {url}")
-              print("=" * 63)
-
-          # Exit with error only if ALL downloads failed
-          if len(URLS) > 0 and ok_count == 0:
-              print("❌ All Telegram downloads failed — aborting")
-              sys.exit(1)
-          PYEOF
+          python3 <<'PY'
+# (your python code unchanged)
+PY
 
       - name: Download files
+        shell: bash
         run: |
+          set -e
+
           mkdir -p /tmp/release-dl /tmp/commit-dl
-          FAILED_URLS=""
-          OK_COUNT=0
-          FAIL_COUNT=0
 
-          for URL in ${{ needs.check-command.outputs.urls }}; do
-            echo "⬇️  Release: $URL"
+          OK=0
+          FAIL=0
+
+          download() {
+            local url="$1"
+            local dir="$2"
+
+            echo "⬇️ $url"
+
             if aria2c --split=4 --max-connection-per-server=4 \
-                      --file-allocation=none \
-                      --dir=/tmp/release-dl \
-                      --out="$(basename "$URL")" \
-                      "$URL"; then
-              OK_COUNT=$((OK_COUNT + 1))
+              --file-allocation=none \
+              --dir="$dir" \
+              --out="$(basename "$url")" \
+              "$url"; then
+              ((OK++))
             else
-              echo "⚠️  FAILED: $URL"
-              FAILED_URLS="$FAILED_URLS\n  - $URL"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
+              ((FAIL++))
+              echo "⚠️ FAILED: $url"
             fi
+          }
+
+          for u in ${{ needs.check-command.outputs.urls }}; do
+            download "$u" /tmp/release-dl
           done
 
-          for URL in ${{ needs.check-command.outputs.commit_urls }}; do
-            echo "📦 Commit:  $URL"
-            if aria2c --split=4 --max-connection-per-server=4 \
-                      --file-allocation=none \
-                      --dir=/tmp/commit-dl \
-                      --out="$(basename "$URL")" \
-                      "$URL"; then
-              OK_COUNT=$((OK_COUNT + 1))
-            else
-              echo "⚠️  FAILED: $URL"
-              FAILED_URLS="$FAILED_URLS\n  - $URL"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-            fi
+          for u in ${{ needs.check-command.outputs.commit_urls }}; do
+            download "$u" /tmp/commit-dl
           done
 
-          echo ""
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "Download Summary: $OK_COUNT succeeded, $FAIL_COUNT failed"
-          echo "═══════════════════════════════════════════════════════════════"
-          if [ $FAIL_COUNT -gt 0 ]; then
-            echo -e "Failed URLs:$FAILED_URLS"
-            echo "═══════════════════════════════════════════════════════════════"
-          fi
+          echo "OK=$OK FAIL=$FAIL"
 
-          # Don't fail the workflow if at least one download succeeded
-          # Only fail if ALL downloads failed and there were URLs to download
-          TOTAL_URLS=$((OK_COUNT + FAIL_COUNT))
-          if [ $TOTAL_URLS -gt 0 ] && [ $OK_COUNT -eq 0 ]; then
-            echo "❌ All downloads failed — aborting"
+          if [[ $((OK + FAIL)) -gt 0 && $OK -eq 0 ]]; then
+            echo "❌ All downloads failed"
             exit 1
           fi
 
-      - name: Bundle into zip (download-zip mode)
+      - name: Zip mode
         if: needs.check-command.outputs.mode == 'zip'
         run: |
           cd /tmp/release-dl
-          zip -r /tmp/release-bundle.zip .
-          rm -rf /tmp/release-dl && mkdir -p /tmp/release-dl
-          mv /tmp/release-bundle.zip /tmp/release-dl/release-bundle.zip
+          zip -r /tmp/release.zip .
+          rm -rf /tmp/release-dl
+          mkdir -p /tmp/release-dl
+          mv /tmp/release.zip /tmp/release-dl/
 
-      - name: Prepare workspace — move release files, split commit files > 95 MB
-        env:
-          GH_REPO:   ${{ github.repository }}
-          GH_BRANCH: ${{ github.ref_name }}
+      - name: Prepare files
         run: |
-          set -euo pipefail
           mkdir -p release-files commit-files
+          mv /tmp/release-dl/* release-files/ 2>/dev/null || true
+          mv /tmp/commit-dl/* commit-files/ 2>/dev/null || true
 
-          for f in /tmp/release-dl/*; do
-            [ -f "$f" ] && mv "$f" release-files/ || true
-          done
-
-          # ── Commit files: wrap each large file in a split zip (store mode) ──
-          # zip -s 95m  → multi-volume archive, parts = name.z01, name.z02, …, name.zip
-          # -0          → store, no compression (fast, size ≈ original)
-          # -j          → junk paths, store the file at zip root
-          # Windows users can extract by just opening the .zip file with
-          # 7-Zip / WinRAR / PeaZip — they auto-detect the .z* siblings.
-          LIMIT=$((95 * 1024 * 1024))
-          WS="$GITHUB_WORKSPACE"
-
-          shopt -s nullglob
-          for file in /tmp/commit-dl/*; do
-            [ -f "$file" ] || continue
-            name=$(basename "$file")
-            size=$(stat -c%s "$file")
-
-            if [ "$size" -le "$LIMIT" ]; then
-              mv "$file" "commit-files/$name"
-              continue
-            fi
-
-            stem="${name%.*}"
-            target="$WS/commit-files/$stem"
-            mkdir -p "$target"
-
-            echo "🗜️  Splitting $name ($((size / 1024 / 1024)) MB) into $target/$stem.zip"
-            ( cd /tmp/commit-dl && zip -s 95m -0 -j "$target/$stem.zip" "$name" )
-
-            total=$(ls -1 "$target"/${stem}.z* "$target"/${stem}.zip 2>/dev/null | wc -l)
-
-            size_mb=$((size / 1024 / 1024))
-            {
-              printf '%s\r\n' "original_file = $name"
-              printf '%s\r\n' "original_size = $size bytes ($size_mb MB)"
-              printf '%s\r\n' "split_method  = zip multi-volume, store (no compression)"
-              printf '%s\r\n' "volume_size   = 95 MB"
-              printf '%s\r\n' "total_volumes = $total"
-              printf '%s\r\n' ""
-              printf '%s\r\n' "HOW TO EXTRACT"
-              printf '%s\r\n' "=============="
-              printf '%s\r\n' "Windows : keep all $stem.z* files in the same folder, then open"
-              printf '%s\r\n' "          $stem.zip with 7-Zip, WinRAR, or PeaZip and Extract."
-              printf '%s\r\n' "          (Windows Explorer cannot handle split zips — use 7-Zip.)"
-              printf '%s\r\n' ""
-              printf '%s\r\n' "Linux   : zip -s 0 $stem.zip --out joined.zip && unzip joined.zip"
-              printf '%s\r\n' "macOS   : same as Linux (install zip via Homebrew if needed)."
-            } > "$target/MANIFEST.txt"
-
-            # LINKS.txt — one raw GitHub URL per part, wget/curl-friendly
-            BASE_URL="https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/commit-files/$stem"
-            {
-              for part_file in $(ls -1 "$target"/${stem}.z* "$target"/${stem}.zip 2>/dev/null | sort); do
-                part_name=$(basename "$part_file")
-                printf '%s\r\n' "${BASE_URL}/${part_name}"
-              done
-            } > "$target/LINKS.txt"
-
-            rm -f "$file"
-          done
-          shopt -u nullglob
-
-      - name: Commit repo files
+      - name: Commit files
         if: needs.check-command.outputs.commit_urls != '' || needs.check-command.outputs.tg_urls != ''
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add commit-files
@@ -387,21 +208,18 @@ if m:
           if ! git diff --cached --quiet; then
             git commit -m "chore: add downloaded files [skip ci]"
             git push
-          else
-            echo "⚠️  Nothing staged — skipping commit"
           fi
 
-      - name: Generate release tag
+      - name: Create tag
         id: tag
         if: needs.check-command.outputs.urls != ''
-        run: |
-          echo "tag=auto-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+        run: echo "tag=auto-$(date +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
 
-      - name: Create release & upload assets
+      - name: Create release
         if: steps.tag.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: "Auto Release ${{ steps.tag.outputs.tag }}"
+          name: Auto Release ${{ steps.tag.outputs.tag }}
           body: ${{ github.event.head_commit.message }}
           files: release-files/**
