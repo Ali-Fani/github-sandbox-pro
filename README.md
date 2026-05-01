@@ -43,11 +43,12 @@ All commands are **prefixes inside the commit message**. URLs follow them, separ
 
 | Command          | Destination                | Size limit       | Behaviour                                                                          |
 | ---------------- | -------------------------- | ---------------- | ---------------------------------------------------------------------------------- |
-| `download:`      | GitHub Release             | 2 GB / file      | Each URL becomes its own release asset                                             |
-| `download-zip:`  | GitHub Release             | 2 GB total       | All URLs are bundled into a single `release-bundle.zip` asset                      |
-| `downloadc:`     | Repo commit (`commit-files/`) | 100 MB / object | Files ≤ 95 MB committed as-is. Larger files are split into a multi-volume zip.     |
+| `download:`      | GitHub Release                | 2 GB / file      | Each URL becomes its own release asset                                          |
+| `download-zip:`  | GitHub Release                | 2 GB total       | All URLs are bundled into a single `release-bundle.zip` asset                   |
+| `downloadc:`     | Repo commit (`commit-files/`) | 100 MB / object  | Files ≤ 95 MB committed as-is. Larger files are split into a multi-volume zip.  |
+| `telegram:`      | Repo commit (`commit-files/`) | 2 GB / file      | Downloads all media from a `t.me/…` post (albums too). Requires 3 TG secrets.  |
 
-> **Note**: GitHub blocks individual git objects > 100 MB, which is why `downloadc:` splits at 95 MB. Releases have no such limit (up to 2 GB per asset).
+> **Note**: GitHub blocks individual git objects > 100 MB, which is why `downloadc:` and `telegram:` split at 95 MB. Releases have no such limit (up to 2 GB per asset).
 
 ---
 
@@ -100,6 +101,37 @@ git push
 
 → `public.bin` goes to a Release; `private.bin` is committed to the repo.
 
+### Download a Telegram post
+
+```bash
+# Single post (public channel)
+git commit --allow-empty -m "telegram: https://t.me/durov/142"
+git push
+```
+
+→ All media from the post is committed to `commit-files/`.
+
+```bash
+# Album post — all items in the group are downloaded automatically
+git commit --allow-empty -m "telegram: https://t.me/somechannel/15"
+git push
+```
+
+```bash
+# Private / restricted channel (your session account must be a member)
+git commit --allow-empty -m "telegram: https://t.me/c/1234567890/678"
+git push
+```
+
+```bash
+# Mix with a regular download
+git commit --allow-empty -m "telegram: https://t.me/durov/142
+download: https://example.com/file.bin"
+git push
+```
+
+→ Telegram media → `commit-files/`; `file.bin` → GitHub Release.
+
 ### Push without a command
 
 ```bash
@@ -111,7 +143,7 @@ git push
 
 ---
 
-## 📦 Reassembling split files (for `downloadc:` over 95 MB)
+## 📦 Reassembling split files (for `downloadc:` / `telegram:` over 95 MB)
 
 The workflow uses **standard zip multi-volume format** (`zip -s 95m -0`), so no custom scripts are needed.
 
@@ -134,7 +166,64 @@ The `MANIFEST.txt` next to the parts repeats these instructions.
 
 ---
 
-## 🔁 Reproduction steps — full setup from scratch
+## � Telegram support
+
+### Why MTProto and not the Bot API?
+
+| | Bot API | MTProto (Pyrogram) |
+|---|---|---|
+| Access public channels by URL | ❌ | ✅ |
+| Access private channels | ❌ (bot must be admin) | ✅ (if account is a member) |
+| Max file size | 20 MB download | 2 GB |
+| Setup complexity | Token only | api_id + api_hash + session |
+
+### One-time setup — 3 GitHub secrets
+
+| Secret | Where to get it |
+|---|---|
+| `TG_API_ID` | [my.telegram.org/apps](https://my.telegram.org/apps) → `api_id` |
+| `TG_API_HASH` | same page → `api_hash` |
+| `TG_SESSION_STRING` | generated with `scripts/gen-session.py` (see below) |
+
+Add them at: **Repo → Settings → Secrets and variables → Actions → New repository secret**.
+
+### Generate the session string
+
+The script is a [PEP 723](https://peps.python.org/pep-0723/) inline-script — **`uv run` installs its own deps automatically into an isolated environment, zero setup required**:
+
+```bash
+# Recommended — uv handles pyrogram + tgcrypto automatically
+uv run scripts/gen-session.py
+
+# Pass credentials inline to skip prompts
+uv run scripts/gen-session.py --api-id 123456 --api-hash abc123def
+
+# Via env vars
+TG_API_ID=123456 TG_API_HASH=abc123def uv run scripts/gen-session.py
+```
+
+No `uv`? Fall back to plain Python (deps must be installed manually):
+
+```bash
+pip install pyrogram tgcrypto
+python scripts/gen-session.py
+```
+
+The script walks you through the Telegram login (phone number → code → optional 2FA), then prints the session string framed for easy copy-paste. No `.session` file is written to disk.
+
+> ⚠️ **Security**: the session string is equivalent to your Telegram password. Only ever paste it into GitHub Actions Secrets — never commit it to a repository.
+
+### Caveats
+
+- **Albums** (media groups): all items are fetched in one run automatically.
+- **File size**: up to 2 GB per file (MTProto limit). Files > 95 MB are split into a multi-volume zip automatically before committing.
+- **FloodWait**: Pyrogram handles Telegram rate-limit errors by sleeping and retrying automatically.
+- **Private channels**: works as long as the account whose session you supplied is a member of the channel.
+- **Text-only posts**: skipped with a warning — only posts with media are downloaded.
+
+---
+
+## �� Reproduction steps — full setup from scratch
 
 ```bash
 # 1. Create the repo locally and push
@@ -171,9 +260,11 @@ Open the **Actions** tab to watch the run, then check the **Releases** tab for t
 ```
 your-repo/
 ├── .github/workflows/download.yml
-├── commit-files/                        ← created by `downloadc:`
-│   ├── small-file.bin                   (≤ 95 MB, kept as-is)
-│   └── big-file/                        (> 95 MB, multi-volume zip)
+├── scripts/
+│   └── gen-session.py               ← run once locally to generate TG_SESSION_STRING
+├── commit-files/                    ← created by `downloadc:` and `telegram:`
+│   ├── small-file.bin               (≤ 95 MB, kept as-is)
+│   └── big-file/                    (> 95 MB, auto-split multi-volume zip)
 │       ├── big-file.z01
 │       ├── big-file.z02
 │       ├── big-file.zip
@@ -190,11 +281,12 @@ push ──▶ check-command job  ──(no command)──▶ workflow ends
               │
               └──(command found)──▶ release-upload job
                                       │
-                                      ├─ install aria2 + zip
+                                      ├─ install aria2 + zip + python3
+                                      ├─ (if telegram:) install pyrogram + download TG media → /tmp/commit-dl/
                                       ├─ download via aria2c
                                       ├─ (zip-mode) bundle release files
                                       ├─ split commit files via `zip -s 95m -0`
-                                      ├─ git add + commit + push (if downloadc:)
+                                      ├─ git add + commit + push (if downloadc: or telegram:)
                                       └─ create GitHub Release (if download:)
 ```
 
@@ -216,7 +308,8 @@ Yes — edit `download.yml`:
 - `LIMIT=$((95 * 1024 * 1024))` and `zip -s 95m` for split size (keep them in sync)
 
 **Does the workflow need any secrets?**
-No. The built-in `${{ secrets.GITHUB_TOKEN }}` is sufficient for both committing and creating releases.
+For `download:` / `download-zip:` / `downloadc:`: no — the built-in `GITHUB_TOKEN` is sufficient.
+For `telegram:`: yes — `TG_API_ID`, `TG_API_HASH`, and `TG_SESSION_STRING` must be set as repo secrets.
 
 **Will it run on every push?**
 The `check-command` job runs on every push, but it's fast and free (Linux runner minutes are unmetered for public repos). The heavy `release-upload` job only runs when a command is detected.
