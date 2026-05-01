@@ -118,97 +118,55 @@ jobs:
             [ -f "$f" ] && mv "$f" release-files/ || true
           done
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import shutil, math
+          # ── Commit files: wrap each large file in a split zip (store mode) ──
+          # zip -s 95m  → multi-volume archive, parts = name.z01, name.z02, …, name.zip
+          # -0          → store, no compression (fast, size ≈ original)
+          # -j          → junk paths, store the file at zip root
+          # Windows users can extract by just opening the .zip file with
+          # 7-Zip / WinRAR / PeaZip — they auto-detect the .z* siblings.
+          LIMIT=$((95 * 1024 * 1024))
+          WS="$GITHUB_WORKSPACE"
 
-          SRC   = Path("/tmp/commit-dl")
-          OUT   = Path("commit-files")
-          LIMIT = 95 * 1024 * 1024
-          CRLF  = "\r\n"
+          shopt -s nullglob
+          for file in /tmp/commit-dl/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            size=$(stat -c%s "$file")
 
-          OUT.mkdir(parents=True, exist_ok=True)
+            if [ "$size" -le "$LIMIT" ]; then
+              mv "$file" "commit-files/$name"
+              continue
+            fi
 
-          if not SRC.exists():
-              raise SystemExit(0)
+            stem="${name%.*}"
+            target="$WS/commit-files/$stem"
+            mkdir -p "$target"
 
-          for file in sorted(SRC.iterdir()):
-              if not file.is_file():
-                  continue
+            echo "🗜️  Splitting $name ($((size / 1024 / 1024)) MB) into $target/$stem.zip"
+            ( cd /tmp/commit-dl && zip -s 95m -0 -j "$target/$stem.zip" "$name" )
 
-              size = file.stat().st_size
+            total=$(ls -1 "$target"/${stem}.z* "$target"/${stem}.zip 2>/dev/null | wc -l)
 
-              if size <= LIMIT:
-                  shutil.move(str(file), str(OUT / file.name))
-                  continue
+            {
+              printf 'original_file = %s\r\n' "$name"
+              printf 'original_size = %s bytes (%s MB)\r\n' "$size" "$((size / 1024 / 1024))"
+              printf 'split_method  = zip multi-volume, store (no compression)\r\n'
+              printf 'volume_size   = 95 MB\r\n'
+              printf 'total_volumes = %s\r\n' "$total"
+              printf '\r\n'
+              printf 'HOW TO EXTRACT\r\n'
+              printf '--------------\r\n'
+              printf 'Windows : keep all %s.z* files in the same folder, then open\r\n' "$stem"
+              printf '          %s.zip with 7-Zip, WinRAR, or PeaZip and "Extract".\r\n' "$stem"
+              printf '          (Windows Explorer cannot handle split zips — use 7-Zip.)\r\n'
+              printf '\r\n'
+              printf 'Linux   : zip -s 0 %s.zip --out joined.zip && unzip joined.zip\r\n' "$stem"
+              printf 'macOS   : same as Linux (install zip via Homebrew if needed).\r\n'
+            } > "$target/MANIFEST.txt"
 
-              total    = math.ceil(size / LIMIT)
-              part_dir = OUT / file.stem
-              part_dir.mkdir(parents=True, exist_ok=True)
-
-              idx = 1
-              with file.open("rb") as fh:
-                  while True:
-                      chunk = fh.read(LIMIT)
-                      if not chunk:
-                          break
-                      (part_dir / f"{file.name}.part{idx:03d}of{total:03d}").write_bytes(chunk)
-                      idx += 1
-
-              # PowerShell reassembly script (works on Windows 5+, binary-safe)
-              ps1 = CRLF.join([
-                  "# Run from the folder that contains the .partXXXofYYY files",
-                  f'$out = "{file.name}"',
-                  f'$parts = Get-ChildItem -Filter "{file.name}.part*" | Sort-Object Name',
-                  '$fs = [IO.File]::OpenWrite($out)',
-                  'foreach ($p in $parts) {',
-                  '    $b = [IO.File]::ReadAllBytes($p.FullName)',
-                  '    $fs.Write($b, 0, $b.Length)',
-                  '}',
-                  '$fs.Close()',
-                  'Write-Host "Done: $out"',
-                  "",
-              ])
-              (part_dir / "reassemble.ps1").write_text(ps1, encoding="utf-8")
-
-              # CMD batch reassembly script (copy /b is binary-safe)
-              parts_arg = "+".join(
-                  f'"{file.name}.part{i:03d}of{total:03d}"'
-                  for i in range(1, total + 1)
-              )
-              bat = CRLF.join([
-                  "@echo off",
-                  f'copy /b {parts_arg} "{file.name}"',
-                  "echo Done.",
-                  "pause",
-                  "",
-              ])
-              (part_dir / "reassemble.bat").write_text(bat, encoding="utf-8")
-
-              # Human-readable manifest with Windows instructions
-              part_list = CRLF.join(
-                  f"  {file.name}.part{i:03d}of{total:03d}"
-                  for i in range(1, total + 1)
-              )
-              manifest = CRLF.join([
-                  f"original_file  = {file.name}",
-                  f"original_size  = {size:,} bytes  ({size / 1024**2:.1f} MB)",
-                  f"chunk_size     = {LIMIT:,} bytes  ({LIMIT / 1024**2:.0f} MB)",
-                  f"total_parts    = {total}",
-                  "",
-                  "HOW TO REASSEMBLE ON WINDOWS",
-                  "-----------------------------",
-                  "Option 1 (PowerShell) — right-click reassemble.ps1 → Run with PowerShell",
-                  "Option 2 (CMD)        — double-click reassemble.bat",
-                  "",
-                  "Part files:",
-                  part_list,
-                  "",
-              ])
-              (part_dir / "MANIFEST.txt").write_text(manifest, encoding="utf-8")
-
-              file.unlink()
-          PY
+            rm -f "$file"
+          done
+          shopt -u nullglob
 
       - name: Commit repo files
         if: needs.check-command.outputs.commit_urls != ''
