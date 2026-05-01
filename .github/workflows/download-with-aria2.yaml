@@ -1,4 +1,4 @@
-name: Download + YouTube → Release
+name: Download → Release
 
 on:
   push:
@@ -6,13 +6,67 @@ on:
       - "**"
 
 jobs:
+  # ── Job 1: lightweight command detection ──────────────────────────────────
+  # Runs a fast checkout + regex check. The entire workflow is skipped when
+  # no recognised command is found in the commit message.
+  # ─────────────────────────────────────────────────────────────────────────
+  check-command:
+    runs-on: ubuntu-latest
+    outputs:
+      has_command: ${{ steps.detect.outputs.has_command }}
+      mode:        ${{ steps.detect.outputs.mode }}
+      urls:        ${{ steps.detect.outputs.urls }}
+      commit_urls: ${{ steps.detect.outputs.commit_urls }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Detect download command in commit message
+        id: detect
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit: $MSG"
+
+          HAS="false"
+          MODE="normal"
+          URLS=""
+          COMMIT_URLS=""
+
+          if echo "$MSG" | grep -qP 'download-zip:'; then
+            MODE="zip"
+            URLS=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
+            HAS="true"
+          elif echo "$MSG" | grep -qP 'download:'; then
+            URLS=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
+            HAS="true"
+          fi
+
+          if echo "$MSG" | grep -qP 'downloadc:'; then
+            COMMIT_URLS=$(echo "$MSG" | grep -oP 'downloadc:\s*\K.*')
+            HAS="true"
+          fi
+
+          echo "has_command=$HAS" >> $GITHUB_OUTPUT
+          echo "mode=$MODE"       >> $GITHUB_OUTPUT
+          echo "urls=$URLS"       >> $GITHUB_OUTPUT
+          echo "commit_urls=$COMMIT_URLS" >> $GITHUB_OUTPUT
+
+          [ "$HAS" = "false" ] && echo "⏭️  No download command — workflow skipped"
+
+  # ── Job 2: download, split, commit and/or release ─────────────────────────
+  # Only runs when Job 1 found a valid command.
+  # ─────────────────────────────────────────────────────────────────────────
   release-upload:
+    needs: check-command
+    if: needs.check-command.outputs.has_command == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout (for commit message)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -20,202 +74,160 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 zip ffmpeg python3-pip git
-          pip install -U yt-dlp
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 zip git
 
-      - name: Extract commands from commit
-        id: extract
+      - name: Download files
         run: |
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
+          mkdir -p /tmp/release-dl /tmp/commit-dl
 
-          MODE="normal"
-          URLS=""
-          YT_URLS=""
-          YT_AUDIO_URLS=""
-          COMMIT_URLS=""
+          for URL in ${{ needs.check-command.outputs.urls }}; do
+            echo "⬇️  Release: $URL"
+            aria2c --split=4 --max-connection-per-server=4 \
+                   --file-allocation=none \
+                   --dir=/tmp/release-dl \
+                   --out="$(basename "$URL")" \
+                   "$URL"
+          done
 
-          if echo "$MSG" | grep -qP 'download-zip:'; then
-            MODE="zip"
-            URLS=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
-          elif echo "$MSG" | grep -qP 'download:'; then
-            URLS=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
-          fi
+          for URL in ${{ needs.check-command.outputs.commit_urls }}; do
+            echo "📦 Commit:  $URL"
+            aria2c --split=4 --max-connection-per-server=4 \
+                   --file-allocation=none \
+                   --dir=/tmp/commit-dl \
+                   --out="$(basename "$URL")" \
+                   "$URL"
+          done
 
-          if echo "$MSG" | grep -qP 'youtube:'; then
-            YT_URLS=$(echo "$MSG" | grep -oP 'youtube:\s*\K.*')
-          fi
-
-          if echo "$MSG" | grep -qP 'youtube-audio:'; then
-            YT_AUDIO_URLS=$(echo "$MSG" | grep -oP 'youtube-audio:\s*\K.*')
-          fi
-
-          if echo "$MSG" | grep -qP 'downloadc:'; then
-            COMMIT_URLS=$(echo "$MSG" | grep -oP 'downloadc:\s*\K.*')
-          fi
-
-          if [ -z "$URLS" ] && [ -z "$YT_URLS" ] && [ -z "$YT_AUDIO_URLS" ] && [ -z "$COMMIT_URLS" ]; then
-            echo "❌ No valid command found"
-            exit 1
-          fi
-
-          echo "mode=$MODE" >> $GITHUB_OUTPUT
-          echo "urls=$URLS" >> $GITHUB_OUTPUT
-          echo "yt_urls=$YT_URLS" >> $GITHUB_OUTPUT
-          echo "yt_audio_urls=$YT_AUDIO_URLS" >> $GITHUB_OUTPUT
-          echo "commit_urls=$COMMIT_URLS" >> $GITHUB_OUTPUT
-
-      - name: Download everything to /tmp
+      - name: Bundle into zip (download-zip mode)
+        if: needs.check-command.outputs.mode == 'zip'
         run: |
-          mkdir -p /tmp/downloads
-          mkdir -p /tmp/commit-downloads
+          cd /tmp/release-dl
+          zip -r /tmp/release-bundle.zip .
+          rm -rf /tmp/release-dl && mkdir -p /tmp/release-dl
+          mv /tmp/release-bundle.zip /tmp/release-dl/release-bundle.zip
 
-          ########################################
-          # 🌐 Normal downloads
-          ########################################
-          for URL in ${{ steps.extract.outputs.urls }}; do
-            FILENAME=$(basename "$URL")
-            echo "⬇️ Downloading $URL"
-
-            aria2c \
-              --split=4 \
-              --max-connection-per-server=4 \
-              --file-allocation=none \
-              --dir="/tmp/downloads" \
-              --out="$FILENAME" \
-              "$URL"
-          done
-
-          ########################################
-          # 🎬 YouTube 720p downloads
-          ########################################
-          for URL in ${{ steps.extract.outputs.yt_urls }}; do
-            echo "🎬 Downloading YouTube (720p): $URL"
-
-            yt-dlp \
-              -f "bestvideo[height<=720]+bestaudio/best[height<=720]" \
-              --merge-output-format mp4 \
-              -o "/tmp/downloads/%(title).200s.%(ext)s" \
-              "$URL"
-          done
-
-          ########################################
-          # 🎧 YouTube audio
-          ########################################
-          for URL in ${{ steps.extract.outputs.yt_audio_urls }}; do
-            echo "🎧 Downloading YouTube audio: $URL"
-
-            yt-dlp \
-              -f bestaudio \
-              --extract-audio \
-              --audio-format mp3 \
-              -o "/tmp/downloads/%(title).200s.%(ext)s" \
-              "$URL"
-          done
-
-          ########################################
-          # 📦 downloadc: → repo commit downloads
-          ########################################
-          for URL in ${{ steps.extract.outputs.commit_urls }}; do
-            FILENAME=$(basename "$URL")
-            echo "📦 Downloading for commit: $URL"
-
-            aria2c \
-              --split=4 \
-              --max-connection-per-server=4 \
-              --file-allocation=none \
-              --dir="/tmp/commit-downloads" \
-              --out="$FILENAME" \
-              "$URL"
-          done
-
-      - name: Prepare files for git and split files over 100MB
+      - name: Prepare workspace — move release files, split commit files > 95 MB
         run: |
           set -euo pipefail
+          mkdir -p release-files commit-files
 
-          mkdir -p downloads
+          for f in /tmp/release-dl/*; do
+            [ -f "$f" ] && mv "$f" release-files/ || true
+          done
 
           python3 - <<'PY'
           from pathlib import Path
-          import shutil
+          import shutil, math
 
-          SRC_DIRS = [Path("/tmp/downloads"), Path("/tmp/commit-downloads")]
-          OUT_DIR = Path("downloads")
+          SRC   = Path("/tmp/commit-dl")
+          OUT   = Path("commit-files")
+          LIMIT = 95 * 1024 * 1024
+          CRLF  = "\r\n"
 
-          LIMIT = 100 * 1024 * 1024      # GitHub hard limit for normal git objects
-          CHUNK = 95 * 1024 * 1024       # keep a safety margin
+          OUT.mkdir(parents=True, exist_ok=True)
 
-          OUT_DIR.mkdir(parents=True, exist_ok=True)
+          if not SRC.exists():
+              raise SystemExit(0)
 
-          for src_dir in SRC_DIRS:
-              if not src_dir.exists():
+          for file in sorted(SRC.iterdir()):
+              if not file.is_file():
                   continue
 
-              for file in src_dir.iterdir():
-                  if not file.is_file():
-                      continue
+              size = file.stat().st_size
 
-                  size = file.stat().st_size
-                  stem = file.stem
+              if size <= LIMIT:
+                  shutil.move(str(file), str(OUT / file.name))
+                  continue
 
-                  # Keep small files as normal files
-                  if size <= LIMIT:
-                      shutil.move(str(file), str(OUT_DIR / file.name))
-                      continue
+              total    = math.ceil(size / LIMIT)
+              part_dir = OUT / file.stem
+              part_dir.mkdir(parents=True, exist_ok=True)
 
-                  # Split large files into a folder named after the file (without extension)
-                  target_dir = OUT_DIR / stem
-                  target_dir.mkdir(parents=True, exist_ok=True)
+              idx = 1
+              with file.open("rb") as fh:
+                  while True:
+                      chunk = fh.read(LIMIT)
+                      if not chunk:
+                          break
+                      (part_dir / f"{file.name}.part{idx:03d}of{total:03d}").write_bytes(chunk)
+                      idx += 1
 
-                  part_index = 1
-                  with file.open("rb") as f:
-                      while True:
-                          chunk = f.read(CHUNK)
-                          if not chunk:
-                              break
+              # PowerShell reassembly script (works on Windows 5+, binary-safe)
+              ps1 = CRLF.join([
+                  "# Run from the folder that contains the .partXXXofYYY files",
+                  f'$out = "{file.name}"',
+                  f'$parts = Get-ChildItem -Filter "{file.name}.part*" | Sort-Object Name',
+                  '$fs = [IO.File]::OpenWrite($out)',
+                  'foreach ($p in $parts) {',
+                  '    $b = [IO.File]::ReadAllBytes($p.FullName)',
+                  '    $fs.Write($b, 0, $b.Length)',
+                  '}',
+                  '$fs.Close()',
+                  'Write-Host "Done: $out"',
+                  "",
+              ])
+              (part_dir / "reassemble.ps1").write_text(ps1, encoding="utf-8")
 
-                          part_name = f"{file.name}.part-{part_index:04d}"
-                          part_path = target_dir / part_name
-                          with part_path.open("wb") as out:
-                              out.write(chunk)
+              # CMD batch reassembly script (copy /b is binary-safe)
+              parts_arg = "+".join(
+                  f'"{file.name}.part{i:03d}of{total:03d}"'
+                  for i in range(1, total + 1)
+              )
+              bat = CRLF.join([
+                  "@echo off",
+                  f'copy /b {parts_arg} "{file.name}"',
+                  "echo Done.",
+                  "pause",
+                  "",
+              ])
+              (part_dir / "reassemble.bat").write_text(bat, encoding="utf-8")
 
-                          part_index += 1
+              # Human-readable manifest with Windows instructions
+              part_list = CRLF.join(
+                  f"  {file.name}.part{i:03d}of{total:03d}"
+                  for i in range(1, total + 1)
+              )
+              manifest = CRLF.join([
+                  f"original_file  = {file.name}",
+                  f"original_size  = {size:,} bytes  ({size / 1024**2:.1f} MB)",
+                  f"chunk_size     = {LIMIT:,} bytes  ({LIMIT / 1024**2:.0f} MB)",
+                  f"total_parts    = {total}",
+                  "",
+                  "HOW TO REASSEMBLE ON WINDOWS",
+                  "-----------------------------",
+                  "Option 1 (PowerShell) — right-click reassemble.ps1 → Run with PowerShell",
+                  "Option 2 (CMD)        — double-click reassemble.bat",
+                  "",
+                  "Part files:",
+                  part_list,
+                  "",
+              ])
+              (part_dir / "MANIFEST.txt").write_text(manifest, encoding="utf-8")
 
-                  # Optional manifest for easier reassembly
-                  manifest = target_dir / "MANIFEST.txt"
-                  manifest.write_text(
-                      f"original_file={file.name}\n"
-                      f"original_size={size}\n"
-                      f"chunk_size={CHUNK}\n"
-                      f"parts={part_index - 1}\n",
-                      encoding="utf-8",
-                  )
-
-                  file.unlink()
+              file.unlink()
           PY
 
       - name: Commit repo files
-        if: steps.extract.outputs.commit_urls != ''
+        if: needs.check-command.outputs.commit_urls != ''
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add downloads
+          git add commit-files
 
           if ! git diff --cached --quiet; then
             git commit -m "chore: add downloaded files [skip ci]"
             git push
           else
-            echo "⚠️ Nothing staged — skipping commit"
+            echo "⚠️  Nothing staged — skipping commit"
           fi
 
       - name: Generate release tag
         id: tag
-        if: steps.extract.outputs.urls != '' || steps.extract.outputs.yt_urls != '' || steps.extract.outputs.yt_audio_urls != ''
+        if: needs.check-command.outputs.urls != ''
         run: |
-          TAG="auto-$(date +%Y%m%d-%H%M%S)"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "tag=auto-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
 
       - name: Create release & upload assets
         if: steps.tag.outputs.tag != ''
@@ -224,4 +236,4 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "Auto Release ${{ steps.tag.outputs.tag }}"
           body: ${{ github.event.head_commit.message }}
-          files: downloads/**
+          files: release-files/**
