@@ -1,4 +1,4 @@
-# git-dozdi — Commit-Driven Downloader for GitHub
+# Git-dozdi — Commit-Driven Downloader for GitHub
 
 A single GitHub Actions workflow (`download.yml`) that turns any repository into
 a remote download/relay machine, **driven entirely by commit messages**.
