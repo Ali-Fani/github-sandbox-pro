@@ -147,21 +147,22 @@ jobs:
 
             total=$(ls -1 "$target"/${stem}.z* "$target"/${stem}.zip 2>/dev/null | wc -l)
 
+            size_mb=$((size / 1024 / 1024))
             {
-              printf 'original_file = %s\r\n' "$name"
-              printf 'original_size = %s bytes (%s MB)\r\n' "$size" "$((size / 1024 / 1024))"
-              printf 'split_method  = zip multi-volume, store (no compression)\r\n'
-              printf 'volume_size   = 95 MB\r\n'
-              printf 'total_volumes = %s\r\n' "$total"
-              printf '\r\n'
-              printf 'HOW TO EXTRACT\r\n'
-              printf '--------------\r\n'
-              printf 'Windows : keep all %s.z* files in the same folder, then open\r\n' "$stem"
-              printf '          %s.zip with 7-Zip, WinRAR, or PeaZip and "Extract".\r\n' "$stem"
-              printf '          (Windows Explorer cannot handle split zips — use 7-Zip.)\r\n'
-              printf '\r\n'
-              printf 'Linux   : zip -s 0 %s.zip --out joined.zip && unzip joined.zip\r\n' "$stem"
-              printf 'macOS   : same as Linux (install zip via Homebrew if needed).\r\n'
+              printf '%s\r\n' "original_file = $name"
+              printf '%s\r\n' "original_size = $size bytes ($size_mb MB)"
+              printf '%s\r\n' "split_method  = zip multi-volume, store (no compression)"
+              printf '%s\r\n' "volume_size   = 95 MB"
+              printf '%s\r\n' "total_volumes = $total"
+              printf '%s\r\n' ""
+              printf '%s\r\n' "HOW TO EXTRACT"
+              printf '%s\r\n' "=============="
+              printf '%s\r\n' "Windows : keep all $stem.z* files in the same folder, then open"
+              printf '%s\r\n' "          $stem.zip with 7-Zip, WinRAR, or PeaZip and Extract."
+              printf '%s\r\n' "          (Windows Explorer cannot handle split zips — use 7-Zip.)"
+              printf '%s\r\n' ""
+              printf '%s\r\n' "Linux   : zip -s 0 $stem.zip --out joined.zip && unzip joined.zip"
+              printf '%s\r\n' "macOS   : same as Linux (install zip via Homebrew if needed)."
             } > "$target/MANIFEST.txt"
 
             rm -f "$file"
